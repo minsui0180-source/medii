@@ -26,8 +26,9 @@ type SpeechRecognitionLike = {
   lang: string;
   interimResults: boolean;
   continuous: boolean;
+  maxAlternatives: number;
   onresult: ((e: { results: ArrayLike<ArrayLike<{ transcript: string; isFinal?: boolean }>>; resultIndex: number }) => void) | null;
-  onerror: ((e: unknown) => void) | null;
+  onerror: ((e: { error?: string }) => void) | null;
   onend: (() => void) | null;
   start: () => void;
   stop: () => void;
@@ -44,6 +45,7 @@ export function createRecognition(lang: string): SpeechRecognitionLike | null {
   rec.lang = lang;
   rec.interimResults = true;
   rec.continuous = true;
+  rec.maxAlternatives = 1;
   return rec;
 }
 

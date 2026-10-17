@@ -53,8 +53,10 @@ export function VoiceIntake({
   onDone: (r: { intake: IntakeResult; transcript: string; answers: { question: string; answer: string }[]; ocr: OcrRecord[] }) => void;
 }) {
   const [transcript, setTranscript] = useState('');
+  const [interim, setInterim] = useState('');
   const [listening, setListening] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(true);
+  const [voiceError, setVoiceError] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [intakeResult, setIntakeResult] = useState<IntakeResult | null>(null);
@@ -62,13 +64,17 @@ export function VoiceIntake({
   const [answers, setAnswers] = useState<{ question: string; answer: string }[]>([]);
   const [ocr, setOcr] = useState<OcrRecord[]>([]);
   const recRef = useRef<ReturnType<typeof createRecognition>>(null);
+  const wantListeningRef = useRef(false);
 
-  function toggleMic() {
-    if (listening) {
-      recRef.current?.stop();
-      setListening(false);
-      return;
-    }
+  function stopMic() {
+    wantListeningRef.current = false;
+    recRef.current?.stop();
+    recRef.current = null;
+    setListening(false);
+    setInterim('');
+  }
+
+  function startMic() {
     const rec = createRecognition(lang);
     if (!rec) {
       setVoiceSupported(false);
@@ -77,16 +83,56 @@ export function VoiceIntake({
     recRef.current = rec;
     rec.onresult = (e) => {
       let finalText = '';
+      let interimText = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i][0];
-        if (e.results[i][0].isFinal || r.isFinal) finalText += r.transcript;
+        if (r.isFinal || e.results[i][0].isFinal) finalText += r.transcript;
+        else interimText += r.transcript;
       }
       if (finalText) setTranscript((prev) => (prev ? `${prev} ${finalText}` : finalText));
+      setInterim(interimText);
     };
-    rec.onerror = () => setListening(false);
-    rec.onend = () => setListening(false);
-    rec.start();
-    setListening(true);
+    rec.onerror = (e) => {
+      // "no-speech" just means silence — keep listening. "not-allowed" means mic blocked.
+      if (e?.error === 'not-allowed' || e?.error === 'service-not-allowed') {
+        setVoiceError(t(lang, 'micBlocked'));
+        wantListeningRef.current = false;
+        setListening(false);
+      } else if (e?.error === 'audio-capture') {
+        setVoiceError(t(lang, 'micNotFound'));
+        wantListeningRef.current = false;
+        setListening(false);
+      }
+    };
+    rec.onend = () => {
+      // Browsers cut recognition after a pause; restart while the user still wants to listen.
+      if (wantListeningRef.current) {
+        try {
+          rec.start();
+          return;
+        } catch {
+          /* already started — fall through */
+        }
+      }
+      setListening(false);
+      setInterim('');
+    };
+    try {
+      rec.start();
+      wantListeningRef.current = true;
+      setListening(true);
+      setVoiceError('');
+    } catch {
+      setVoiceError(t(lang, 'micStartFailed'));
+    }
+  }
+
+  function toggleMic() {
+    if (listening) {
+      stopMic();
+      return;
+    }
+    startMic();
   }
 
   async function analyze() {
@@ -149,15 +195,25 @@ export function VoiceIntake({
       <p className="text-sm text-emerald-700">{t(lang, 'intakeHint')}</p>
 
       {voiceSupported ? (
-        <button
-          onClick={toggleMic}
-          className={`btn-touch w-full !min-h-[72px] !text-lg flex items-center justify-center gap-3 ${
-            listening ? 'bg-red-600 text-white pulse-red' : 'bg-emerald-700 hover:bg-emerald-800 text-white'
-          }`}
-        >
-          {listening ? <MicOff className="w-7 h-7" /> : <Mic className="w-7 h-7" />}
-          {listening ? t(lang, 'micStop') : t(lang, 'micStart')}
-        </button>
+        <>
+          <button
+            onClick={toggleMic}
+            className={`btn-touch w-full !min-h-[72px] !text-lg flex items-center justify-center gap-3 ${
+              listening ? 'bg-red-600 text-white pulse-red' : 'bg-emerald-700 hover:bg-emerald-800 text-white'
+            }`}
+          >
+            {listening ? <MicOff className="w-7 h-7" /> : <Mic className="w-7 h-7" />}
+            {listening ? t(lang, 'micStop') : t(lang, 'micStart')}
+          </button>
+          {interim && (
+            <p className="text-sm text-emerald-600 italic px-1">{interim}…</p>
+          )}
+          {voiceError && (
+            <p className="text-sm text-red-700 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4" /> {voiceError}
+            </p>
+          )}
+        </>
       ) : (
         <p className="text-sm text-amber-800 flex items-center gap-2">
           <AlertTriangle className="w-4 h-4" /> {t(lang, 'voiceUnavailable')}
