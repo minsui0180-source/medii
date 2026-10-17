@@ -1,8 +1,9 @@
 import { useRef, useState } from 'react';
 import { Upload, Loader2, AlertTriangle } from 'lucide-react';
-import { api } from '@/lib/supabase';
-import type { OcrRecord, LangCode } from '@/types';
+import { ocrPrescription, type OcrRecord } from '@/lib/api';
+import type { LangCode } from '@/types';
 import { t } from '@/lib/i18n';
+import { compressImage } from '@/lib/helpers';
 
 export function OcrUploader({
   lang,
@@ -20,21 +21,8 @@ export function OcrUploader({
     setBusy(true);
     setError('');
     try {
-      const buf = await file.arrayBuffer();
-      let binary = '';
-      const bytes = new Uint8Array(buf);
-      const chunk = 0x8000;
-      for (let i = 0; i < bytes.length; i += chunk) {
-        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-      }
-      const imageBase64 = btoa(binary);
-      const mime = file.type || 'image/jpeg';
-      const data = await api<{
-        medicines: OcrRecord['medicines'];
-        header?: string;
-        warnings?: string[];
-        mock: boolean;
-      }>('ocr', { imageBase64, mime });
+      const { base64, mime } = await compressImage(file);
+      const data = await ocrPrescription({ imageBase64: base64, mime });
       const rec: OcrRecord = {
         file: file.name,
         date: new Date().toISOString().slice(0, 10),
@@ -45,7 +33,8 @@ export function OcrUploader({
       setRecord(rec);
       onSaved(rec);
     } catch (e) {
-      setError((e as Error).message || t(lang, 'errorGeneric'));
+      const msg = (e as Error).message;
+      setError(msg === 'imageTooLarge' ? 'Image is larger than 5 MB.' : msg || t(lang, 'errorGeneric'));
     } finally {
       setBusy(false);
     }

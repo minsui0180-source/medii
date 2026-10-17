@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Phone, Ambulance, ArrowLeft } from 'lucide-react';
-import type { LangCode, Hospital, OcrRecord, Patient, IntakeResult, StaffUser } from '@/types';
-import { supabase } from '@/lib/supabase';
-import { formatToken } from '@/lib/helpers';
+import type { LangCode, Hospital, OcrRecord, IntakeResult, StaffUser, PatientRecord } from '@/types';
+import { patientLookup, queueSubmit, hospitalsList, type QueueSubmitResult } from '@/lib/api';
 import { Header } from '@/components/Chrome';
 import { EntryScreen, type EntryResult } from '@/screens/EntryScreen';
 import { RedPath } from '@/screens/RedPath';
@@ -14,22 +13,17 @@ import { t } from '@/lib/i18n';
 
 interface GreenState {
   stage: 'ABHA' | 'HOSPITAL' | 'INTAKE' | 'QUEUE';
-  patient: { name: string; abhaId: string | null; prior: { conditions: string[]; medicines: string[]; past_visits: string[]; ocr_prescriptions: OcrRecord[] } | null };
+  patient: { name: string; abhaId: string | null; prior: PatientRecord | null };
   hospital: Hospital | null;
-  token: string;
-  entryId: string;
+  submitted: QueueSubmitResult | null;
   intake: IntakeResult | null;
   ocr: OcrRecord[];
-}
-
-interface Escalation {
-  reason: string;
 }
 
 export default function App() {
   const [entry, setEntry] = useState<EntryResult | null>(null);
   const [green, setGreen] = useState<GreenState | null>(null);
-  const [escalation, setEscalation] = useState<Escalation | null>(null);
+  const [escalation, setEscalation] = useState<string | null>(null);
   const [staffUser, setStaffUser] = useState<StaffUser | null>(null);
   const [staffLoginOpen, setStaffLoginOpen] = useState(false);
   const [hospitals, setHospitals] = useState<Hospital[]>([]);
@@ -37,8 +31,9 @@ export default function App() {
   const lang: LangCode = entry?.lang ?? 'en-IN';
 
   useEffect(() => {
-    supabase.from('hospitals').select('*').then(({ data }) => setHospitals((data as Hospital[]) ?? []));
-  }, []);
+    if (!entry) return;
+    hospitalsList().then((d) => setHospitals(d.hospitals ?? [])).catch(() => undefined);
+  }, [entry]);
 
   const start = useCallback((r: EntryResult) => {
     setEntry(r);
@@ -48,7 +43,7 @@ export default function App() {
     } else if (r.path === 'RED') {
       setGreen(null);
     } else {
-      setGreen({ stage: 'ABHA', patient: { name: '', abhaId: null, prior: null }, hospital: null, token: '', entryId: '', intake: null, ocr: [] });
+      setGreen({ stage: 'ABHA', patient: { name: '', abhaId: null, prior: null }, hospital: null, submitted: null, intake: null, ocr: [] });
     }
   }, []);
 
@@ -65,6 +60,7 @@ export default function App() {
   const [phoneInput, setPhoneInput] = useState('');
   const [abhaError, setAbhaError] = useState('');
   const [newPatientMode, setNewPatientMode] = useState(false);
+  const [lookupBusy, setLookupBusy] = useState(false);
 
   async function lookupAbha() {
     const id = abhaInput.trim();
@@ -73,32 +69,19 @@ export default function App() {
       return;
     }
     setAbhaError('');
-    const { data } = await supabase.from('patients').select('*').eq('abha_id', id).maybeSingle();
-    const p = data as Patient | null;
-    setGreen((g) =>
-      g
-        ? {
-            ...g,
-            patient: {
-              name: p?.name ?? 'New patient',
-              abhaId: id,
-              prior: p
-                ? {
-                    conditions: p.conditions,
-                    medicines: p.medicines,
-                    past_visits: p.past_visits,
-                    ocr_prescriptions: p.ocr_prescriptions,
-                  }
-                : null,
-            },
-            stage: 'HOSPITAL',
-          }
-        : g,
-    );
+    setLookupBusy(true);
+    try {
+      const { patient } = await patientLookup(id);
+      setGreen((g) => (g ? { ...g, patient: { name: patient?.name ?? 'New patient', abhaId: id, prior: patient }, stage: 'HOSPITAL' } : g));
+    } catch (e) {
+      setAbhaError((e as Error).message || t(lang, 'errorGeneric'));
+    } finally {
+      setLookupBusy(false);
+    }
   }
 
   function continueAsNew() {
-    if (!phoneInput.trim()) {
+    if (!/^\+?\d{10,13}$/.test(phoneInput.replace(/\s/g, ''))) {
       setAbhaError(t(lang, 'phonePlaceholder'));
       return;
     }
@@ -107,33 +90,23 @@ export default function App() {
 
   async function submitQueue(intake: IntakeResult, transcript: string, answers: { question: string; answer: string }[], ocr: OcrRecord[]) {
     if (!green || !entry || !green.hospital) return;
-    // priority: EMERGENCY 100, URGENT 60, ROUTINE 20 (+ up to 20 waiting, set later by sort)
-    const base = intake.triage_level === 'EMERGENCY' ? 100 : intake.triage_level === 'URGENT' ? 60 : 20;
-    const { count } = await supabase.from('queue_entries').select('*', { count: 'exact', head: true });
-    const token = formatToken((count ?? 0) + 1);
-    const { data, error } = await supabase
-      .from('queue_entries')
-      .insert({
-        patient_label: green.patient.name,
-        abha_id: green.patient.abhaId,
-        phone: phoneInput || null,
+    try {
+      const result = await queueSubmit({
         language: entry.lang,
+        abha_id: green.patient.abhaId ?? undefined,
+        phone: phoneInput || undefined,
+        hospital_id: green.hospital.id,
+        triage_floor: entry.path === 'YELLOW' ? 'URGENT' : 'ROUTINE',
         transcript,
         followup_answers: answers,
-        triage_level: intake.triage_level,
-        summary: intake.summary,
-        source_tags: intake.source_tags,
-        prior_history: green.patient.prior,
+        intake,
+        prior_history: green.patient.prior ?? undefined,
         ocr_records: ocr,
-        hospital_id: green.hospital.id,
-        token,
-        priority_score: base,
-        status: 'SENT_TO_DOCTOR',
-      })
-      .select()
-      .single();
-    if (error || !data) return;
-    setGreen((g) => (g ? { ...g, stage: 'QUEUE', token, entryId: (data as { id: string }).id, intake } : g));
+      });
+      setGreen((g) => (g ? { ...g, stage: 'QUEUE', submitted: result, intake } : g));
+    } catch {
+      setEscalation('');
+    }
   }
 
   // ---- render ----
@@ -168,7 +141,7 @@ export default function App() {
     return (
       <div className="min-h-screen">
         <Header lang={lang} onHome={home} />
-        <RedPath lang={lang} location={entry.location!} onStaffLogin={() => setStaffLoginOpen(true)} />
+        <RedPath lang={lang} location={entry.location} />
       </div>
     );
   }
@@ -176,12 +149,12 @@ export default function App() {
   // GREEN / YELLOW
   if (!green) return null;
 
-  if (escalation) {
+  if (escalation !== null) {
     return (
       <div className="min-h-screen bg-red-700 flex flex-col items-center justify-center p-6 text-center">
         <Ambulance className="w-16 h-16 text-white mb-4 pulse-red rounded-full p-2" />
         <h1 className="text-3xl font-bold text-white mb-2">{t(lang, 'escalationTitle')}</h1>
-        <p className="text-red-100 mb-6">{escalation.reason}</p>
+        {escalation && <p className="text-red-100 mb-6">{escalation}</p>}
         <button
           onClick={() => { setEntry({ ...entry, path: 'RED' }); setEscalation(null); }}
           className="btn-touch !min-h-[88px] !text-2xl w-full max-w-sm bg-white text-red-700 flex items-center justify-center gap-3 mb-3"
@@ -213,13 +186,10 @@ export default function App() {
             />
             <p className="text-xs text-emerald-700">{t(lang, 'abhaHint')}</p>
             {abhaError && <p className="text-sm text-red-700">{abhaError}</p>}
-            <button onClick={lookupAbha} className="btn-touch w-full bg-emerald-700 hover:bg-emerald-800 text-white">
+            <button onClick={lookupAbha} disabled={lookupBusy} className="btn-touch w-full bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-50">
               {t(lang, 'continue')}
             </button>
-            <button
-              onClick={() => setNewPatientMode(true)}
-              className="w-full text-sm text-emerald-800 underline py-1"
-            >
+            <button onClick={() => setNewPatientMode(true)} className="w-full text-sm text-emerald-800 underline py-1">
               {t(lang, 'noAbha')}
             </button>
             {newPatientMode && (
@@ -228,6 +198,7 @@ export default function App() {
                   value={phoneInput}
                   onChange={(e) => setPhoneInput(e.target.value)}
                   placeholder={t(lang, 'phonePlaceholder')}
+                  inputMode="tel"
                   className="w-full border-2 border-emerald-200 rounded-xl px-3 text-lg min-h-[52px] focus:border-emerald-500 outline-none"
                 />
                 <button onClick={continueAsNew} className="btn-touch w-full bg-emerald-600 text-white">
@@ -236,6 +207,13 @@ export default function App() {
               </div>
             )}
           </div>
+          {green.patient.prior && (
+            <div className="card p-4 space-y-1 text-sm">
+              <h3 className="font-bold text-emerald-900">{t(lang, 'priorRecords')}</h3>
+              <p className="text-emerald-800">{t(lang, 'conditions')}: {green.patient.prior.conditions.join(', ') || '—'}</p>
+              <p className="text-emerald-800">{t(lang, 'medicines')}: {green.patient.prior.medicines.join(', ') || '—'}</p>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -247,7 +225,7 @@ export default function App() {
         <Header lang={lang} onHome={home} />
         <HospitalChooser
           lang={lang}
-          location={entry.location!}
+          location={entry.location ?? { lat: 28.6139, lng: 77.209 }}
           hospitals={hospitals}
           selected={green.hospital?.id ?? null}
           onSelect={(id) => setGreen((g) => (g ? { ...g, hospital: hospitals.find((h) => h.id === id) ?? null } : g))}
@@ -263,8 +241,9 @@ export default function App() {
         <Header lang={lang} onHome={home} />
         <VoiceIntake
           lang={lang}
-          patient={green.patient}
-          onEscalate={(reason) => setEscalation({ reason })}
+          triageFloor={entry.path === 'YELLOW' ? 'URGENT' : 'ROUTINE'}
+          prior={green.patient.prior}
+          onEscalate={(reason) => setEscalation(reason)}
           onDone={({ intake, transcript, answers, ocr }) => submitQueue(intake, transcript, answers, ocr)}
         />
       </div>
@@ -277,11 +256,9 @@ export default function App() {
       <Header lang={lang} onHome={home} />
       <QueueStatus
         lang={lang}
-        token={green.token}
+        submitted={green.submitted!}
         hospitalName={green.hospital?.name ?? ''}
-        entryId={green.entryId}
         intake={green.intake!}
-        ocr={green.ocr}
         onStaffLogin={() => setStaffLoginOpen(true)}
       />
     </div>

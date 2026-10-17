@@ -2,10 +2,8 @@ import { useState } from 'react';
 import { LogOut, Loader2, ShieldAlert } from 'lucide-react';
 import { t } from '@/lib/i18n';
 import type { LangCode, StaffUser } from '@/types';
-import { api } from '@/lib/supabase';
-import { useQueueLive, useEmergencyRequestsLive } from '@/lib/live';
+import { staffLogin, setStaffToken, clearStaffToken } from '@/lib/api';
 import { DemoBadge } from '@/components/Chrome';
-import { OcrUploader } from '@/components/OcrUploader';
 import { DoctorView, ReceptionView, AdminView } from '@/components/RoleViews';
 
 export function StaffLogin({ lang, onLoggedIn, onBack }: { lang: LangCode; onLoggedIn: (u: StaffUser) => void; onBack: () => void }) {
@@ -18,7 +16,8 @@ export function StaffLogin({ lang, onLoggedIn, onBack }: { lang: LangCode; onLog
     setBusy(true);
     setError('');
     try {
-      const { user } = await api<{ user: StaffUser }>('staff/login', { username, password });
+      const { token, user } = await staffLogin(username, password);
+      setStaffToken(token);
       onLoggedIn(user);
     } catch (e) {
       setError((e as Error).message || t(lang, 'errorGeneric'));
@@ -60,8 +59,10 @@ export function StaffLogin({ lang, onLoggedIn, onBack }: { lang: LangCode; onLog
 }
 
 export function StaffDashboard({ lang, user, onLogout }: { lang: LangCode; user: StaffUser; onLogout: () => void }) {
-  const { queue, hospitals } = useQueueLive();
-  const requests = useEmergencyRequestsLive();
+  function logout() {
+    clearStaffToken();
+    onLogout();
+  }
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 space-y-4 fade-in">
@@ -70,15 +71,15 @@ export function StaffDashboard({ lang, user, onLogout }: { lang: LangCode; user:
           <h1 className="text-xl font-bold text-emerald-900">{user.display_name}</h1>
           <p className="text-sm text-emerald-700">{user.role} — demo access</p>
         </div>
-        <button onClick={onLogout} className="btn-touch !min-h-[48px] bg-white border-2 border-emerald-300 text-emerald-800 flex items-center gap-2">
+        <button onClick={logout} className="btn-touch !min-h-[48px] bg-white border-2 border-emerald-300 text-emerald-800 flex items-center gap-2">
           <LogOut className="w-5 h-5" /> {t(lang, 'logout')}
         </button>
       </div>
       <DemoBadge />
 
-      {user.role === 'DOCTOR' && <DoctorView lang={lang} queue={queue} />}
-      {user.role === 'RECEPTION' && <ReceptionView lang={lang} queue={queue} />}
-      {user.role === 'ADMIN' && <AdminView lang={lang} hospitals={hospitals} requests={requests} />}
+      {user.role === 'DOCTOR' && <DoctorView lang={lang} />}
+      {user.role === 'RECEPTION' && <ReceptionView lang={lang} />}
+      {user.role === 'ADMIN' && <AdminView lang={lang} />}
     </div>
   );
 }

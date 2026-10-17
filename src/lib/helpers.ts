@@ -1,6 +1,4 @@
-// Browser helpers: geolocation, Web Speech API, distance, queue math.
-
-import type { QueueEntry } from '@/types';
+// Browser helpers: geolocation, Web Speech API, image compression, distance.
 
 export function haversineKm(a: { lat: number; lng: number }, b: { lat: number; lng: number }): number {
   const R = 6371;
@@ -61,34 +59,42 @@ export function speak(text: string, lang: string) {
   }
 }
 
-export function baseScore(level: string): number {
-  return level === 'EMERGENCY' ? 100 : level === 'URGENT' ? 60 : 20;
-}
-
-export function waitingPoints(createdAt: string): number {
-  return Math.min(20, Math.round((Date.now() - new Date(createdAt).getTime()) / 120000));
-}
-
-export function priorityScore(e: Pick<QueueEntry, 'triage_level' | 'created_at'>): number {
-  return baseScore(e.triage_level) + waitingPoints(e.created_at);
-}
-
-export function sortQueue<T extends Pick<QueueEntry, 'triage_level' | 'created_at' | 'priority_score'>>(rows: T[]): T[] {
-  return [...rows].sort((a, b) => {
-    const diff = priorityScore(b) - priorityScore(a);
-    if (diff !== 0) return diff;
-    return a.priority_score - b.priority_score; // reception manual order (lower = earlier)
-  });
-}
-
-export function formatToken(seq: number): string {
-  return `OPD-${String(1000 + seq).padStart(4, '0')}`;
-}
-
 export function estimateWaitMinutes(position: number): number {
   return position * 8;
 }
 
 export function validateAbha(id: string): boolean {
   return /^91-\d{4}-\d{4}-\d{4}$/.test(id.trim());
+}
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_EDGE_PX = 1600;
+
+// Compress to max 1600px edge / JPEG 0.8 before upload; reject files already over 5MB.
+export async function compressImage(file: File): Promise<{ base64: string; mime: string }> {
+  if (file.size > MAX_IMAGE_BYTES) throw new Error('imageTooLarge');
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result as string);
+    r.onerror = () => reject(new Error('readFailed'));
+    r.readAsDataURL(file);
+  });
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = () => reject(new Error('badImage'));
+    im.src = dataUrl;
+  });
+  const scale = Math.min(1, MAX_EDGE_PX / Math.max(img.width, img.height));
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+  canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const out = canvas.toDataURL('image/jpeg', 0.8);
+  return { base64: out.slice(out.indexOf(',') + 1), mime: 'image/jpeg' };
+}
+
+export function formatClock(seconds: number): string {
+  const s = Math.max(0, Math.ceil(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }

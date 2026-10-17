@@ -1,47 +1,67 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Mic, MicOff, Loader2, Keyboard, AlertTriangle, Phone, ArrowRight, CheckCircle2 } from 'lucide-react';
+import { useRef, useState } from 'react';
+import { Mic, MicOff, Loader2, Keyboard, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { intake, type IntakeResult, type OcrRecord } from '@/lib/api';
+import type { LangCode, PatientRecord } from '@/types';
 import { t } from '@/lib/i18n';
-import type { LangCode, IntakeResult, OcrRecord, Patient, SourceTag } from '@/types';
-import { api } from '@/lib/supabase';
 import { createRecognition, speak } from '@/lib/helpers';
 import { DemoBadge } from '@/components/Chrome';
 import { OcrUploader } from '@/components/OcrUploader';
 
-interface PriorHistory {
-  conditions: string[];
-  medicines: string[];
-  past_visits: string[];
-  ocr_prescriptions: OcrRecord[];
+const MAX_FOLLOWUPS = 3;
+
+export function IntakeSummaryCard({ intake, lang }: { intake: IntakeResult; lang: LangCode }) {
+  const levelColor =
+    intake.triage_level === 'EMERGENCY' ? 'bg-red-100 text-red-900 border-red-300'
+    : intake.triage_level === 'URGENT' ? 'bg-amber-100 text-amber-900 border-amber-300'
+    : 'bg-emerald-100 text-emerald-900 border-emerald-300';
+  return (
+    <div className="card p-4 space-y-2 fade-in">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="font-bold text-emerald-900">{t(lang, 'aiSuggestion')}</h3>
+        <span className={`text-xs font-bold rounded-full px-2 py-1 border ${levelColor}`}>{intake.triage_level}</span>
+      </div>
+      <p className="text-emerald-900">
+        <span className="font-semibold">{t(lang, 'chiefComplaint')}:</span> {intake.summary.chief_complaint}
+      </p>
+      <p className="text-sm text-emerald-800">{t(lang, 'duration')}: {intake.summary.duration} · {t(lang, 'severity')}: {intake.summary.severity}/10</p>
+      {intake.summary.relevant_history.length > 0 && (
+        <p className="text-sm text-emerald-800">{t(lang, 'relevantHistory')}: {intake.summary.relevant_history.join(', ')}</p>
+      )}
+      {intake.source_tags.length > 0 && (
+        <p className="text-xs text-emerald-700">
+          {t(lang, 'sourceTags')}: {intake.source_tags.map((s) => `${s.claim} (${s.source})`).join(' · ')}
+        </p>
+      )}
+      {intake.mock && (
+        <p className="text-xs text-amber-800 flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> {t(lang, 'aiMockNote')}</p>
+      )}
+    </div>
+  );
 }
 
-interface Props {
+export function VoiceIntake({
+  lang,
+  triageFloor,
+  prior,
+  onEscalate,
+  onDone,
+}: {
   lang: LangCode;
-  patient: { name: string; abhaId: string | null; prior: PriorHistory | null };
+  triageFloor: 'ROUTINE' | 'URGENT';
+  prior: PatientRecord | null;
   onEscalate: (reason: string) => void;
-  onDone: (result: { intake: IntakeResult; transcript: string; answers: { question: string; answer: string }[]; ocr: OcrRecord[] }) => void;
-}
-
-const MAX_TURNS = 4;
-
-export function VoiceIntake({ lang, patient, onEscalate, onDone }: Props) {
+  onDone: (r: { intake: IntakeResult; transcript: string; answers: { question: string; answer: string }[]; ocr: OcrRecord[] }) => void;
+}) {
+  const [transcript, setTranscript] = useState('');
   const [listening, setListening] = useState(false);
   const [voiceSupported, setVoiceSupported] = useState(true);
-  const [typed, setTyped] = useState('');
-  const [transcript, setTranscript] = useState('');
   const [busy, setBusy] = useState(false);
-  const [intake, setIntake] = useState<IntakeResult | null>(null);
-  const [answers, setAnswers] = useState<{ question: string; answer: string }[]>([]);
-  const [currentAnswer, setCurrentAnswer] = useState('');
-  const [turns, setTurns] = useState(0);
   const [error, setError] = useState('');
-  const [ocrRecords, setOcrRecords] = useState<OcrRecord[]>([]);
+  const [intakeResult, setIntakeResult] = useState<IntakeResult | null>(null);
+  const [followupAnswer, setFollowupAnswer] = useState('');
+  const [answers, setAnswers] = useState<{ question: string; answer: string }[]>([]);
+  const [ocr, setOcr] = useState<OcrRecord[]>([]);
   const recRef = useRef<ReturnType<typeof createRecognition>>(null);
-
-  useEffect(() => {
-    return () => {
-      recRef.current?.stop();
-    };
-  }, []);
 
   function toggleMic() {
     if (listening) {
@@ -55,17 +75,13 @@ export function VoiceIntake({ lang, patient, onEscalate, onDone }: Props) {
       return;
     }
     recRef.current = rec;
-    let finalText = '';
     rec.onresult = (e) => {
-      let interim = '';
+      let finalText = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
-        const res = e.results[i];
-        if (res[0].transcript) {
-          if (i < e.results.length && (res as unknown as { isFinal?: boolean }).isFinal) finalText += res[0].transcript + ' ';
-          else interim += res[0].transcript;
-        }
+        const r = e.results[i][0];
+        if (e.results[i][0].isFinal || r.isFinal) finalText += r.transcript;
       }
-      setTranscript((patient.name ? '' : '') + (finalText + interim).trim());
+      if (finalText) setTranscript((prev) => (prev ? `${prev} ${finalText}` : finalText));
     };
     rec.onerror = () => setListening(false);
     rec.onend = () => setListening(false);
@@ -73,23 +89,24 @@ export function VoiceIntake({ lang, patient, onEscalate, onDone }: Props) {
     setListening(true);
   }
 
-  async function submit(text: string) {
-    if (!text.trim() || busy) return;
+  async function analyze() {
+    if (!transcript.trim() && answers.length === 0) return;
     setBusy(true);
     setError('');
     try {
-      const data = await api<IntakeResult>('intake', {
+      const result = await intake({
         language: lang,
-        transcript: text,
-        prior_history: patient.prior,
+        transcript: transcript.trim(),
+        triage_floor: triageFloor,
+        prior_history: prior ?? undefined,
+        followup_answers: answers.length ? answers : undefined,
       });
-      if (data.triage_level === 'EMERGENCY' && data.emergency_reason) {
-        onEscalate(data.emergency_reason);
+      if (result.triage_level === 'EMERGENCY') {
+        onEscalate(result.emergency_reason ?? '');
         return;
       }
-      setIntake(data);
-      setTranscript(text);
-      speak(data.summary?.chief_complaint ?? '', lang);
+      setIntakeResult(result);
+      if (result.followup_question) speak(result.followup_question, lang);
     } catch (e) {
       setError((e as Error).message || t(lang, 'errorGeneric'));
     } finally {
@@ -97,210 +114,114 @@ export function VoiceIntake({ lang, patient, onEscalate, onDone }: Props) {
     }
   }
 
-  async function answerFollowup(value: string) {
-    if (!intake || busy) return;
-    const q = intake.followup_questions[answers.length];
-    const next = [...answers, { question: q, answer: value }];
+  async function submitAnswer() {
+    if (!intakeResult?.followup_question || !followupAnswer.trim()) return;
+    const next = [...answers, { question: intakeResult.followup_question, answer: followupAnswer.trim() }];
     setAnswers(next);
-    setCurrentAnswer('');
-    const newText = `${transcript} ${q} ${value}`.trim();
-    setTranscript(newText);
-    const nextTurn = turns + 1;
-    setTurns(nextTurn);
-    const remaining = intake.followup_questions.length - next.length;
-    if (remaining <= 0 || nextTurn >= MAX_TURNS) {
-      onDone({ intake, transcript: newText, answers: next, ocr: ocrRecords });
-      return;
-    }
+    setFollowupAnswer('');
     setBusy(true);
     try {
-      const data = await api<IntakeResult>('followup', {
+      const result = await intake({
         language: lang,
-        transcript: newText,
-        prior_history: patient.prior,
+        transcript: transcript.trim(),
+        triage_floor: triageFloor,
+        prior_history: prior ?? undefined,
+        followup_answers: next,
       });
-      if (data.triage_level === 'EMERGENCY' && data.emergency_reason) {
-        onEscalate(data.emergency_reason);
+      if (result.triage_level === 'EMERGENCY') {
+        onEscalate(result.emergency_reason ?? '');
         return;
       }
-      setIntake({ ...data, followup_questions: data.followup_questions.slice(0, Math.max(0, remaining - 1 > 0 ? remaining : 0)) });
+      setIntakeResult(result);
     } catch (e) {
-      setError((e as Error).message);
+      setError((e as Error).message || t(lang, 'errorGeneric'));
     } finally {
       setBusy(false);
     }
   }
 
-  const currentQuestion = intake?.followup_questions[answers.length];
-
-  if (intake && currentQuestion) {
-    return (
-      <div className="max-w-2xl mx-auto px-4 py-6 space-y-4 fade-in">
-        <div className="card p-5 space-y-4">
-          <h2 className="text-lg font-bold text-emerald-900">{t(lang, 'followupTitle')}</h2>
-          <p className="text-xl font-medium text-emerald-900">{currentQuestion}</p>
-          <div className="grid grid-cols-2 gap-3">
-            {['Yes', 'No'].map((c) => (
-              <button
-                key={c}
-                onClick={() => answerFollowup(c)}
-                className={`btn-touch ${c === 'Yes' ? 'bg-emerald-600 text-white' : 'bg-red-500 text-white'}`}
-              >
-                {c === 'Yes' ? t(lang, 'yes') : t(lang, 'no')}
-              </button>
-            ))}
-          </div>
-          <div className="flex gap-2">
-            <input
-              value={currentAnswer}
-              onChange={(e) => setCurrentAnswer(e.target.value)}
-              placeholder={t(lang, 'answer')}
-              className="flex-1 border-2 border-emerald-200 rounded-xl px-3 text-lg min-h-[52px] focus:border-emerald-500 outline-none"
-            />
-            <button
-              onClick={() => answerFollowup(currentAnswer)}
-              disabled={!currentAnswer.trim() || busy}
-              className="btn-touch bg-emerald-700 text-white px-5 flex items-center disabled:opacity-40"
-            >
-              <ArrowRight className="w-5 h-5" />
-            </button>
-          </div>
-        </div>
-        {busy && (
-          <p className="flex items-center gap-2 text-emerald-700">
-            <Loader2 className="w-4 h-4 animate-spin" /> {t(lang, 'loading')}
-          </p>
-        )}
-        {error && <p className="text-sm text-red-700">{error}</p>}
-      </div>
-    );
-  }
-
-  if (intake && !currentQuestion) {
-    return (
-      <div className="max-w-2xl mx-auto px-4 py-6 space-y-4 fade-in">
-        <IntakeSummaryCard lang={lang} intake={intake} prior={patient.prior} />
-        <button
-          onClick={() => onDone({ intake, transcript, answers, ocr: ocrRecords })}
-          className="btn-touch w-full bg-emerald-700 hover:bg-emerald-800 text-white"
-        >
-          {t(lang, 'continue')}
-        </button>
-      </div>
-    );
-  }
+  const canSubmit = intakeResult && (!intakeResult.followup_question || answers.length >= MAX_FOLLOWUPS);
 
   return (
     <div className="max-w-2xl mx-auto px-4 py-6 space-y-4 fade-in">
+      <DemoBadge />
       <h2 className="text-xl font-bold text-emerald-900">{t(lang, 'intakeTitle')}</h2>
-      <p className="text-emerald-700">{t(lang, 'intakeHint')}</p>
+      <p className="text-sm text-emerald-700">{t(lang, 'intakeHint')}</p>
 
-      {patient.prior && (
-        <div className="card p-4 space-y-2">
-          <div className="flex items-center gap-2">
-            <h3 className="font-bold text-emerald-900">{t(lang, 'priorRecords')}</h3>
-            <DemoBadge />
-          </div>
-          <p className="text-sm"><span className="font-semibold text-emerald-900">{patient.name}</span></p>
-          <div className="grid sm:grid-cols-2 gap-2 text-sm text-emerald-800">
-            <p><span className="font-semibold">{t(lang, 'conditions')}:</span> {patient.prior.conditions.join(', ') || '—'}</p>
-            <p><span className="font-semibold">{t(lang, 'medicines')}:</span> {patient.prior.medicines.join(', ') || '—'}</p>
-          </div>
-          {patient.prior.ocr_prescriptions.length > 0 && (
-            <div className="text-xs text-emerald-700 border-t border-emerald-100 pt-2">
-              <span className="font-semibold">{t(lang, 'ocrPrescriptions')}:</span>{' '}
-              {patient.prior.ocr_prescriptions[0].medicines.map((m) => `${m.name} (${m.ocr_confidence}%)`).join(', ')}
-            </div>
-          )}
-        </div>
-      )}
-
-      <button
-        onClick={toggleMic}
-        className={`btn-touch !min-h-[112px] w-full flex flex-col items-center justify-center gap-2 ${
-          listening ? 'bg-red-600 text-white pulse-red' : 'bg-emerald-700 hover:bg-emerald-800 text-white'
-        }`}
-      >
-        {listening ? <MicOff className="w-9 h-9" /> : <Mic className="w-9 h-9" />}
-        <span className="text-lg">{listening ? t(lang, 'micStop') : t(lang, 'micStart')}</span>
-      </button>
-      {!voiceSupported && <p className="text-sm text-amber-800 flex items-center gap-1"><AlertTriangle className="w-4 h-4" /> {t(lang, 'voiceUnavailable')}</p>}
-
-      {transcript && (
-        <div className="card p-3 text-emerald-900 bg-emerald-50 border-emerald-200 text-sm">
-          <span className="font-semibold">{t(lang, 'speakNow')}:</span> {transcript}
-        </div>
-      )}
-
-      <div className="flex gap-2">
-        <div className="flex-1 flex items-center gap-2 border-2 border-emerald-200 rounded-xl px-3 min-h-[52px]">
-          <Keyboard className="w-5 h-5 text-emerald-600 shrink-0" />
-          <input
-            value={typed}
-            onChange={(e) => setTyped(e.target.value)}
-            placeholder={t(lang, 'typeHere')}
-            className="flex-1 outline-none text-lg bg-transparent"
-          />
-        </div>
+      {voiceSupported ? (
         <button
-          onClick={() => submit(typed || transcript)}
-          disabled={(!typed.trim() && !transcript.trim()) || busy}
-          className="btn-touch bg-emerald-700 hover:bg-emerald-800 text-white px-6 disabled:opacity-40 flex items-center gap-2"
+          onClick={toggleMic}
+          className={`btn-touch w-full !min-h-[72px] !text-lg flex items-center justify-center gap-3 ${
+            listening ? 'bg-red-600 text-white pulse-red' : 'bg-emerald-700 hover:bg-emerald-800 text-white'
+          }`}
         >
-          {busy ? <Loader2 className="w-5 h-5 animate-spin" /> : null}
-          {t(lang, 'submit')}
+          {listening ? <MicOff className="w-7 h-7" /> : <Mic className="w-7 h-7" />}
+          {listening ? t(lang, 'micStop') : t(lang, 'micStart')}
         </button>
-      </div>
-      {error && <p className="text-sm text-red-700">{error}</p>}
-
-      <OcrUploader lang={lang} onSaved={(rec) => setOcrRecords((r) => [...r, rec])} />
-    </div>
-  );
-}
-
-export function IntakeSummaryCard({
-  lang,
-  intake,
-  prior,
-}: {
-  lang: LangCode;
-  intake: IntakeResult;
-  prior: PriorHistory | null;
-}) {
-  const tags: SourceTag[] = intake.source_tags ?? [];
-  return (
-    <div className="card p-4 space-y-3">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[10px] font-bold tracking-wide bg-sky-100 text-sky-900 border border-sky-300 rounded-full px-2 py-0.5 uppercase">
-          {t(lang, 'aiSuggestion')}
-        </span>
-        {intake.mock && <DemoBadge />}
-      </div>
-      <div className="grid sm:grid-cols-2 gap-2 text-sm">
-        <p><span className="font-semibold text-emerald-900">{t(lang, 'chiefComplaint')}:</span> {intake.summary?.chief_complaint}</p>
-        <p><span className="font-semibold text-emerald-900">{t(lang, 'duration')}:</span> {intake.summary?.duration}</p>
-        <p><span className="font-semibold text-emerald-900">{t(lang, 'severity')}:</span> {intake.summary?.severity}/10</p>
-      </div>
-      {prior && (
-        <p className="text-sm text-emerald-800">
-          <span className="font-semibold">{t(lang, 'relevantHistory')}:</span>{' '}
-          {[...prior.conditions, ...(intake.summary?.relevant_history ?? [])].join(' · ')}
+      ) : (
+        <p className="text-sm text-amber-800 flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4" /> {t(lang, 'voiceUnavailable')}
         </p>
       )}
-      {tags.length > 0 && (
-        <div className="text-xs space-y-1 border-t border-emerald-100 pt-2">
-          <span className="font-semibold text-emerald-900">{t(lang, 'sourceTags')}:</span>
-          {tags.map((tag, i) => (
-            <p key={i} className="text-emerald-700">
-              <span className="inline-block bg-emerald-100 rounded px-1.5 mr-1 font-medium">{tag.source}</span>
-              {tag.claim}
-            </p>
-          ))}
+
+      <div className="relative">
+        <textarea
+          value={transcript}
+          onChange={(e) => setTranscript(e.target.value)}
+          placeholder={t(lang, 'typeHere')}
+          rows={3}
+          className="w-full border-2 border-emerald-200 rounded-xl px-3 py-2 text-base focus:border-emerald-500 outline-none"
+        />
+        <Keyboard className="w-4 h-4 text-emerald-400 absolute right-3 top-3" />
+      </div>
+
+      <button
+        onClick={analyze}
+        disabled={busy || (!transcript.trim() && answers.length === 0)}
+        className="btn-touch w-full bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-50 flex items-center justify-center gap-2"
+      >
+        {busy && <Loader2 className="w-5 h-5 animate-spin" />} {t(lang, 'submit')}
+      </button>
+      {error && <p className="text-sm text-red-700">{error}</p>}
+
+      {intakeResult && <IntakeSummaryCard intake={intakeResult} lang={lang} />}
+
+      {intakeResult?.followup_question && answers.length < MAX_FOLLOWUPS && (
+        <div className="card p-4 space-y-2 border-2 border-amber-200 bg-amber-50">
+          <p className="font-medium text-amber-900">{intakeResult.followup_question}</p>
+          <input
+            value={followupAnswer}
+            onChange={(e) => setFollowupAnswer(e.target.value)}
+            placeholder={t(lang, 'answer')}
+            className="w-full border-2 border-amber-200 rounded-xl px-3 min-h-[52px] focus:border-amber-400 outline-none"
+          />
+          <button onClick={submitAnswer} disabled={busy || !followupAnswer.trim()} className="btn-touch w-full bg-amber-500 hover:bg-amber-600 text-white disabled:opacity-50">
+            {t(lang, 'nextQuestion')}
+          </button>
         </div>
       )}
-      <p className="text-[11px] text-emerald-600 flex items-center gap-1">
-        <CheckCircle2 className="w-3 h-3" /> Not a diagnosis — for clinician review only.
-      </p>
+
+      {answers.length > 0 && (
+        <ul className="text-sm space-y-1">
+          {answers.map((a, i) => (
+            <li key={i} className="text-emerald-800 flex gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
+              <span><span className="font-medium">{a.question}</span> — {a.answer}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <OcrUploader lang={lang} onSaved={(rec) => setOcr((o) => [...o, rec])} />
+
+      {canSubmit && (
+        <button
+          onClick={() => onDone({ intake: intakeResult, transcript: transcript.trim(), answers, ocr })}
+          className="btn-touch w-full !min-h-[60px] !text-lg bg-emerald-600 hover:bg-emerald-700 text-white"
+        >
+          {t(lang, 'preArrival')} →
+        </button>
+      )}
     </div>
   );
 }

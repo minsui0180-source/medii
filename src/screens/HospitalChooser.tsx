@@ -78,7 +78,7 @@ export function HospitalChooser({ lang, location, hospitals, selected, onSelect,
                     {selected === h.id && <CheckCircle2 className="w-4 h-4 text-emerald-600" />}
                     {h.name}
                   </p>
-                  <p className="text-xs text-emerald-700">{h.address}</p>
+                  <p className="text-xs text-emerald-700">{h.area}, {h.city}</p>
                   <p className="text-xs text-emerald-600 mt-1">{h.specialties.join(' · ')}</p>
                 </div>
                 <div className="text-right text-sm whitespace-nowrap">
